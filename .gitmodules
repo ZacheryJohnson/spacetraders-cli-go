@@ -1,0 +1,3 @@
+[submodule "spacetraders-spec"]
+	path = spacetraders-spec
+	url = https://github.com/SpaceTradersAPI/api-docs.git
