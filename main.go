@@ -1,17 +1,15 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
 	"path"
 	"strings"
 
-	spec "github.com/ZacheryJohnson/spacetraders_cli_go"
+	spec "github.com/ZacheryJohnson/spacetraders-cli-go"
 
 	"github.com/urfave/cli/v2" // imports as package "cli"
 )
@@ -23,7 +21,7 @@ func main() {
 		Commands: []*cli.Command{
 			{
 				Name:  "init",
-				Usage: "initializes a new game instance",
+				Usage: "initializes a new game account",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
 						Name:     "symbol",
@@ -36,6 +34,20 @@ func main() {
 				},
 			},
 			{
+				Name:  "activate",
+				Usage: "activates an existing game account",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:     "symbol",
+						Usage:    "Name of the existing account",
+						Required: true,
+					},
+				},
+				Action: func(ctx *cli.Context) error {
+					return activate(ctx.String("symbol"))
+				},
+			},
+			{
 				Name:  "get",
 				Usage: "returns information on different resources",
 				Subcommands: []*cli.Command{
@@ -43,7 +55,8 @@ func main() {
 						Name:  "agent",
 						Usage: "gets information on your agent",
 						Action: func(ctx *cli.Context) error {
-							_, err := get_agent()
+							agent, err := get_agent()
+							prettyPrint(agent)
 							return err
 						},
 					},
@@ -51,7 +64,8 @@ func main() {
 						Name:  "contracts",
 						Usage: "gets information on your contracts",
 						Action: func(ctx *cli.Context) error {
-							_, err := get_contracts()
+							contracts, err := get_contracts()
+							prettyPrint(contracts)
 							return err
 						},
 					},
@@ -62,7 +76,24 @@ func main() {
 						},
 						Usage: "gets information on your headquarters",
 						Action: func(ctx *cli.Context) error {
-							_, err := get_headquarters() // ZJ-TODO: allow non-current positions as args
+							headquarters, err := get_headquarters() // ZJ-TODO: allow non-current positions as args
+							prettyPrint(headquarters)
+							return err
+						},
+					},
+					{
+						Name:  "system",
+						Usage: "gets information on a system",
+						Flags: []cli.Flag{
+							&cli.StringFlag{
+								Name:     "symbol",
+								Usage:    "Name of the system",
+								Required: true,
+							},
+						},
+						Action: func(ctx *cli.Context) error {
+							system, err := get_system(ctx.String("symbol"))
+							prettyPrint(system)
 							return err
 						},
 					},
@@ -76,33 +107,32 @@ func main() {
 	}
 }
 
-func getToken() (string, error) {
-	tokenPath := path.Join(getHomeDir(), "user.token")
-	data, err := os.ReadFile(tokenPath)
-	if err != nil {
-		return "", err
-	}
-
-	return string(data), nil
+func prettyPrint(i interface{}) {
+	s, _ := json.MarshalIndent(i, "", "\t")
+	fmt.Printf("%s\n", s)
 }
 
-func getHomeDir() string {
-	// Make a new directory at a known good path for a token + config
-	dirname, dirErr := os.UserHomeDir()
-	if dirErr != nil {
-		panic(dirErr)
-	}
-
-	return path.Join(dirname, ".spacetraders")
-}
-
-func isInitialized() bool {
+func getApiClient() spec.APIClient {
+	apiClientConfig := spec.NewConfiguration()
 	token, err := getToken()
 	if err != nil {
-		return false
+		panic(err)
+	}
+	bearerStr := fmt.Sprintf("Bearer %s", token)
+	apiClientConfig.AddDefaultHeader("Authorization", bearerStr)
+	return *spec.NewAPIClient(apiClientConfig)
+}
+
+func activate(symbol string) error {
+	config, readErr := loadConfig()
+	if readErr != nil {
+		return readErr
 	}
 
-	return len(token) > 0
+	config.ActiveSymbol = symbol
+
+	writeErr := writeConfig(config)
+	return writeErr
 }
 
 func initialize(symbol string) error {
@@ -113,34 +143,32 @@ func initialize(symbol string) error {
 
 	dirpath := getHomeDir()
 
-	if _, err := os.Stat(dirpath); os.IsNotExist(err) {
+	if _, statErr := os.Stat(dirpath); os.IsNotExist(statErr) {
 		mkdirErr := os.Mkdir(dirpath, 0755)
 		if mkdirErr != nil {
 			panic(mkdirErr)
 		}
 	}
 
-	req := *spec.NewRegisterRequest("COSMIC", symbol)
-	reqJson, err := req.MarshalJSON()
-	fmt.Println(string(reqJson))
-	if err != nil {
-		panic(err)
+	configPath := path.Join(dirpath, getConfigFileName())
+	if _, configStatErr := os.Stat(configPath); os.IsNotExist(configStatErr) {
+		newConfig := Config{ActiveSymbol: symbol}
+		writeConfig(newConfig)
 	}
 
-	resp, err := http.Post("https://api.spacetraders.io/v2/register", "application/json", bytes.NewReader(reqJson))
-	if resp.StatusCode != 201 {
-		fmt.Println(resp)
-		panic(err)
+	client := getApiClient().DefaultApi
+
+	req := client.Register(context.TODO()).RegisterRequest(spec.RegisterRequest{
+		Faction: "COSMIC", // ZJ-TODO
+		Symbol:  symbol,
+	})
+
+	resp, _, rpcErr := client.RegisterExecute(req)
+	if rpcErr != nil {
+		panic(rpcErr)
 	}
 
-	respBody, _ := ioutil.ReadAll(resp.Body)
-
-	var data map[string]map[string]interface{}
-	if err := json.Unmarshal(respBody, &data); err != nil {
-		panic(err)
-	}
-
-	acctToken := data["data"]["token"].(string)
+	acctToken := resp.Data.Token
 	tokenFile := fmt.Sprintf("%s.token", symbol)
 	tokenPath := path.Join(dirpath, tokenFile) // ZJ-TODO: support multiple different users?
 	if err := os.WriteFile(tokenPath, []byte(acctToken), 0644); err != nil {
@@ -157,37 +185,15 @@ func get_agent() (spec.Agent, error) {
 		return *spec.NewAgentWithDefaults(), nil
 	}
 
-	req, err := http.NewRequest(http.MethodGet, "https://api.spacetraders.io/v2/my/agent", nil)
+	client := getApiClient().AgentsApi
+	req := client.GetMyAgent(context.TODO())
+
+	resp, _, err := client.GetMyAgentExecute(req)
 	if err != nil {
-		return *spec.NewAgentWithDefaults(), err
+		return spec.Agent{}, err
 	}
 
-	token, err := getToken()
-	if err != nil {
-		return *spec.NewAgentWithDefaults(), err
-	}
-
-	req.Header = http.Header{
-		"Authorization": {fmt.Sprintf("Bearer %s", token)},
-	}
-
-	client := http.Client{}
-	resp, err := client.Do(req)
-	if err != nil || resp.StatusCode >= 300 {
-		fmt.Println(resp)
-		return *spec.NewAgentWithDefaults(), err
-	}
-
-	respBody, _ := ioutil.ReadAll(resp.Body)
-	var agentResp spec.NullableGetMyAgent200Response
-	agentResp.UnmarshalJSON(respBody)
-	agent := agentResp.Get().Data
-
-	fmt.Println(agent.AccountId)
-	fmt.Println(agent.Credits)
-	fmt.Println(agent.Headquarters)
-	fmt.Println(agent.Symbol)
-
+	agent := resp.Data
 	return agent, nil
 }
 
@@ -197,92 +203,59 @@ func get_contracts() ([]spec.Contract, error) {
 		return []spec.Contract{}, nil
 	}
 
-	req, err := http.NewRequest(http.MethodGet, "https://api.spacetraders.io/v2/my/contracts", nil)
+	client := getApiClient().ContractsApi
+	req := client.GetContracts(context.TODO())
+
+	resp, _, err := client.GetContractsExecute(req)
 	if err != nil {
 		return []spec.Contract{}, err
 	}
 
-	token, err := getToken()
-	if err != nil {
-		return []spec.Contract{}, err
-	}
-
-	req.Header = http.Header{
-		"Authorization": {fmt.Sprintf("Bearer %s", token)},
-	}
-
-	client := http.Client{}
-	resp, err := client.Do(req)
-	if err != nil || resp.StatusCode >= 300 {
-		fmt.Println(resp)
-		return []spec.Contract{}, err
-	}
-
-	respBody, _ := ioutil.ReadAll(resp.Body)
-	var contractsResp spec.NullableGetContracts200Response
-	contractsResp.UnmarshalJSON(respBody)
-	contracts := contractsResp.Get().Data
-
-	fmt.Println("Contracts:")
-	for idx, contract := range contracts {
-		fmt.Printf("(%d) ---------\n", idx+1)
-		fmt.Println("Id:", contract.Id)
-		fmt.Println("Accepted:", contract.Accepted)
-		fmt.Println("Expiration:", contract.Expiration)
-		fmt.Println("Fulfilled:", contract.Fulfilled)
-		fmt.Println("Faction Symbol:", contract.FactionSymbol)
-		fmt.Println("Terms:", contract.Terms)
-		fmt.Println("Type:", contract.Type)
-	}
-
+	contracts := resp.Data
 	return contracts, nil
 }
 
 func get_headquarters() (spec.Waypoint, error) {
 	if !isInitialized() {
 		fmt.Println("You do not have an account. Create one with `initialize` first.")
-		return *spec.NewWaypointWithDefaults(), nil
+		return spec.Waypoint{}, nil
 	}
 
 	agent, err := get_agent()
+	if err != nil {
+		return spec.Waypoint{}, err
+	}
 	lastIdx := strings.LastIndex(agent.Headquarters, "-")
 	systemStr := agent.Headquarters[:lastIdx]
-	waypointStr := agent.Headquarters[lastIdx+1:]
-	uri := fmt.Sprintf("https://api.spacetraders.io/v2/systems/%s/waypoints/%s-%s", systemStr, systemStr, waypointStr)
 
-	fmt.Println(uri)
+	fmt.Printf("%s %s\n", systemStr, agent.Headquarters)
 
-	req, err := http.NewRequest(http.MethodGet, uri, nil)
-	if err != nil {
-		return *spec.NewWaypointWithDefaults(), err
+	client := getApiClient().SystemsApi
+	req := client.GetWaypoint(context.TODO(), systemStr, agent.Headquarters)
+
+	resp, _, rpcErr := client.GetWaypointExecute(req)
+	if rpcErr != nil {
+		return spec.Waypoint{}, rpcErr
 	}
 
-	token, err := getToken()
-	if err != nil {
-		return *spec.NewWaypointWithDefaults(), err
+	waypoint := resp.Data
+	return waypoint, nil
+}
+
+func get_system(symbol string) (spec.System, error) {
+	if !isInitialized() {
+		fmt.Println("You do not have an account. Create one with `initialize` first.")
+		return spec.System{}, nil
 	}
 
-	req.Header = http.Header{
-		"Authorization": {fmt.Sprintf("Bearer %s", token)},
+	client := getApiClient().SystemsApi
+	req := client.GetSystem(context.TODO(), symbol)
+
+	resp, _, rpcErr := client.GetSystemExecute(req)
+	if rpcErr != nil {
+		return spec.System{}, rpcErr
 	}
 
-	client := http.Client{}
-	resp, err := client.Do(req)
-	if err != nil || resp.StatusCode >= 300 {
-		fmt.Println(resp)
-		return *spec.NewWaypointWithDefaults(), err
-	}
-
-	respBody, _ := ioutil.ReadAll(resp.Body)
-	var waypointResp spec.NullableGetWaypoint200Response
-	waypointResp.UnmarshalJSON(respBody)
-	waypoint := waypointResp.Get().Data
-	fmt.Println(waypoint.X)
-	fmt.Println(waypoint.Y)
-	fmt.Println(waypoint.Type)
-	fmt.Println(waypoint.Symbol)
-	fmt.Println(waypoint.SystemSymbol)
-
-	// ZJ-TODO: just return one? what do
-	return *spec.NewWaypointWithDefaults(), nil
+	system := resp.Data
+	return system, nil
 }
